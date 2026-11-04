@@ -1202,6 +1202,30 @@ bool Buffer::GetFDHandleForMem(void* dev_ptr, size_t size, bool vmm, void* handl
 #endif
       return false;
     }
+
+    // hsa_amd_vmem_export_shareable_handle() exports the single physical allocation handle that
+    // backs dev_ptr; it takes one alloc handle and has no notion of the requested range size. When
+    // [dev_ptr, dev_ptr + size) spans more than one hipMemMap'ed physical chunk (e.g. PyTorch
+    // expandable_segments / vLLM cumem pools), the exported dmabuf therefore covers only the first
+    // mapping. Rather than silently return hipSuccess with a truncated dmabuf (which a downstream
+    // ibv_reg_dmabuf_mr would reject with EINVAL), detect the short export and fail so the caller
+    // can tell. We only treat a *measured* short size as a failure: if the fd's size cannot be
+    // queried we fall through and preserve the previous behavior.
+#if !IS_WINDOWS
+    off_t dmabuf_size = lseek(dmabuffd, 0, SEEK_END);
+    if (dmabuf_size >= 0) {
+      lseek(dmabuffd, 0, SEEK_SET);  // restore the file offset; dmabuf export mutated it above
+      if (static_cast<size_t>(dmabuf_size) < size) {
+        LogPrintfError(
+            "Exported VMM dmabuf (size: %ld) is smaller than the requested range (size: %lu) for "
+            "dev_ptr: 0x%x; the range spans multiple mappings, which cannot be exported as a "
+            "single dmabuf",
+            static_cast<long>(dmabuf_size), size, dev_ptr);
+        close(dmabuffd);
+        return false;
+      }
+    }
+#endif
   } else {
     // Retrieve a shareable handle for the device ptr.
     hsa_status_t hsa_status = Hsa::portable_export_dmabuf(dev_ptr, size, &dmabuffd, &offset);
